@@ -298,6 +298,20 @@ else:
 # Float8CurrentScaling: fused_attn_bwd takes O in FP8 by default, this flag allows it in F16
 _dpa_fp8_cs_o_in_f16 = os.getenv("NVTE_DPA_FP8CS_O_in_F16", "1") == "1"
 
+
+def _is_cuda_graph_capturing() -> bool:
+    """Return whether DPA is executing under either TE or raw CUDA capture.
+
+    ``is_graph_capturing`` tracks TE's ``make_graphed_callables`` lifecycle,
+    but a direct ``torch.cuda.graph`` capture does not set that Python flag.
+    The attention C++ graph cache must receive the capture bit in both cases;
+    otherwise the CroissAttn auxiliary-output quantization can build a new
+    cuDNN graph or allocate graph state during replay.
+    """
+    if is_graph_capturing():
+        return True
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
 # CroissAttn's FP8 backward correction needs the unrounded attention output
 # ``O_aux = P @ V_f``.  The cuDNN FP8 backward API receives the forward output
 # tensor, so delayed-scaling attention normally gives it the rounded FP8 ``O``.
@@ -1776,12 +1790,6 @@ def _fused_attn_forward_impl(
         and is_bwd_fp8
         and qkv_type == "delayed"
     )
-    if croissattn_aux_correction and is_graph_capturing():
-        raise RuntimeError(
-            "NVTE_DPA_CROISSATTN_AUX is not graph-capture safe yet; "
-            "disable the switch for CUDA-graph training."
-        )
-
     # get nominal data type for out
     # FP16/BF16 attention: torch.float16 or torch.bfloat16
     # FP8 attention:       torch.float16 or torch.bfloat16
@@ -1874,7 +1882,7 @@ def _fused_attn_forward_impl(
             args.bottom_right_diagonal,
             args.rng_gen,
             args.softmax_offset,
-            cuda_graph=is_graph_capturing(),
+            cuda_graph=_is_cuda_graph_capturing(),
         )
 
         # out_fp8: Float8Tensor/MXFP8Tensor; dtype = torch.float16 or torch.bfloat16
@@ -1991,7 +1999,7 @@ def _fused_attn_forward_impl(
             args.rng_gen,
             args.softmax_offset,
             args.return_max_logit,
-            is_graph_capturing(),
+            _is_cuda_graph_capturing(),
         )
         max_logit = max_logit[0] if max_logit else None
         out_f16 = out_
@@ -2380,7 +2388,7 @@ def _fused_attn_backward_impl(
                     args.window_size,
                     args.bottom_right_diagonal,
                     args.deterministic,
-                    is_graph_capturing(),
+                    _is_cuda_graph_capturing(),
                 )
                 # dq, dk, dv:             torch.Tensor; dtype = torch.float16 or torch.bfloat16
                 dq, dk, dv = dq_, dk_, dv_
@@ -2449,7 +2457,7 @@ def _fused_attn_backward_impl(
                     args.window_size,
                     args.bottom_right_diagonal,
                     args.deterministic,
-                    is_graph_capturing(),
+                    _is_cuda_graph_capturing(),
                 )
 
     d_bias = None

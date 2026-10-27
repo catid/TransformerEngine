@@ -4133,7 +4133,7 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
         # MXFP8/F16: torch.float16 or torch.bfloat16
         # [b, s, h, d] -> [b, 2, s//2, h, d]
         # [s, b, h, d] -> [2, s//2, b, h, d]
-        if ctx.fp8 and (
+        if ctx.fp8 and not ctx.croissattn_aux_correction and (
             ctx.fp8_recipe.delayed()
             or (ctx.fp8_recipe.float8_current_scaling() and not _dpa_fp8_cs_o_in_f16)
         ):

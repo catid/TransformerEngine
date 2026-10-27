@@ -93,6 +93,7 @@ _THD_POLICY_BACKEND_ENV_VARS = (
     "NVTE_FLASH_ATTN_V4",
     "NVTE_FUSED_ATTN",
     "NVTE_UNFUSED_ATTN",
+    "NVTE_DPA_CROISSATTN_AUX",
 )
 _thd_policy_backend_cache = []
 
@@ -2806,6 +2807,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                 "num_splits": num_splits,
                 "softmax_scale": self.softmax_scale,
                 "fp8_output": fp8_output,
+                "croissattn_aux": os.environ.get("NVTE_DPA_CROISSATTN_AUX", "0") == "1",
                 "checkpoint_core_attention": checkpoint_core_attention,
                 "has_score_mod": score_mod is not None,
                 "has_score_mod_bprop": score_mod_bprop is not None,

@@ -74,6 +74,18 @@ def _reject_custom_recipe_under_cp(fp8, fp8_recipe):
     lands, surface the limitation here with a clear error rather than
     failing later in C++ assertions or with silently-wrong gradients.
     """
+    if (
+        fp8
+        and os.environ.get("NVTE_DPA_CROISSATTN_AUX", "0") == "1"
+        and int(os.environ.get("NVTE_FP8_DPA_BWD", "1"))
+        and fp8_recipe is not None
+        and fp8_recipe.delayed()
+    ):
+        raise NotImplementedError(
+            "NVTE_DPA_CROISSATTN_AUX currently supports single-device fused attention only; "
+            "context-parallel delayed-scaling FP8 attention is not implemented. Disable "
+            "NVTE_DPA_CROISSATTN_AUX when using context parallelism."
+        )
     if fp8 and fp8_recipe is not None and fp8_recipe.custom():
         raise NotImplementedError(
             "CustomRecipe + Context Parallelism is not yet supported for FP8 "

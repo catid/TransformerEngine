@@ -298,7 +298,14 @@ else:
 # Float8CurrentScaling: fused_attn_bwd takes O in FP8 by default, this flag allows it in F16
 _dpa_fp8_cs_o_in_f16 = os.getenv("NVTE_DPA_FP8CS_O_in_F16", "1") == "1"
 
-
+# CroissAttn's FP8 backward correction needs the unrounded attention output
+# ``O_aux = P @ V_f``.  The cuDNN FP8 backward API receives the forward output
+# tensor, so delayed-scaling attention normally gives it the rounded FP8 ``O``.
+# The opt-in path below asks cuDNN to materialize the same output in F16,
+# quantizes a separate copy for the user-visible result, and feeds the F16
+# auxiliary output back to cuDNN.  Keeping this disabled by default preserves
+# the upstream execution path while making the correction available for
+# reproducible experiments.
 def _qkv_quantizer_type(qkv_quantizer):
     """Map a DPA QKV quantizer instance to its kernel-facing FP8 sub-recipe label.
 
@@ -1654,6 +1661,7 @@ class FusedAttnBwdArgs:
     dQKV_quantizer: Optional[Any] = None
     dO_quantizer: Optional[Any] = None
     dP_quantizer: Optional[Any] = None
+    croissattn_aux_correction: Optional[bool] = None
 
     def setup_saved_tensors(self, ctx: torch.autograd.function.FunctionCtx) -> None:
         """Pull saved tensors from ``ctx`` into the fields backward consumes."""
@@ -1760,6 +1768,20 @@ def _fused_attn_forward_impl(
     # without depending on `fp8_recipe.<predicate>()`.
     qkv_type = _qkv_quantizer_type(QKV_quantizer) if fp8 else None
 
+    # Delayed-scaling FP8 is the recipe whose forward output is rounded to
+    # FP8.  Current-scaling and MXFP8 already keep O in F16 for backward.
+    croissattn_aux_correction = (
+        os.environ.get("NVTE_DPA_CROISSATTN_AUX", "0") == "1"
+        and is_training
+        and is_bwd_fp8
+        and qkv_type == "delayed"
+    )
+    if croissattn_aux_correction and is_graph_capturing():
+        raise RuntimeError(
+            "NVTE_DPA_CROISSATTN_AUX is not graph-capture safe yet; "
+            "disable the switch for CUDA-graph training."
+        )
+
     # get nominal data type for out
     # FP16/BF16 attention: torch.float16 or torch.bfloat16
     # FP8 attention:       torch.float16 or torch.bfloat16
@@ -1808,6 +1830,19 @@ def _fused_attn_forward_impl(
         #                                     fp8_dtype = tex.DType.kFloat8E4M3
         # Float8CurrentScaling: torch.Tensor; dtype = torch.float16 or torch.bfloat16
         # MXFP8BlockScaling:    torch.Tensor; dtype = torch.float16 or torch.bfloat16
+        # When enabled, keep the cuDNN output in F16.  A current-scaling
+        # quantizer is used only as an allocator for the F16 tensor and its
+        # amax buffer; the user-visible delayed-scaling FP8 O is quantized
+        # separately below.  This lets cuDNN build its normal F16-O graph
+        # without a null amax pointer.
+        kernel_o_quantizer = O_quantizer
+        if croissattn_aux_correction:
+            kernel_o_quantizer = Float8CurrentScalingQuantizer(
+                fp8_dtype=O_quantizer.dtype,
+                device=q.device,
+                rowwise=True,
+                columnwise=False,
+            )
         out_, aux_ctx_tensors, *_ = fused_attn_fwd(
             is_training,
             args.max_seqlen_q,
@@ -1825,7 +1860,7 @@ def _fused_attn_forward_impl(
             None,
             None,
             S_quantizer,
-            O_quantizer,
+            kernel_o_quantizer,
             args.attn_scale,
             args.dropout_p,
             args.fast_zero_fill,
@@ -1847,11 +1882,16 @@ def _fused_attn_forward_impl(
         # out:     torch.Tensor; dtype = torch.float16 or torch.bfloat16
         out_fp8 = out_
         out_f16 = out_
+        out_aux_f16 = None
         bwd_requires_o_f16 = is_training and (
             not is_bwd_fp8
             or (
                 is_bwd_fp8
-                and ((qkv_type == "current" and _dpa_fp8_cs_o_in_f16) or qkv_type == "mxfp8")
+                and (
+                    croissattn_aux_correction
+                    or (qkv_type == "current" and _dpa_fp8_cs_o_in_f16)
+                    or qkv_type == "mxfp8"
+                )
             )
         )
         bwd_requires_o_fp8 = (
@@ -1859,12 +1899,24 @@ def _fused_attn_forward_impl(
             and is_bwd_fp8
             and (qkv_type == "delayed" or (qkv_type == "current" and not _dpa_fp8_cs_o_in_f16))
         )
+        if croissattn_aux_correction and isinstance(out_, QuantizedTensorStorage):
+            raise RuntimeError(
+                "CroissAttn auxiliary correction requires cuDNN to return an "
+                "unquantized F16 output; got a quantized output tensor."
+            )
         if isinstance(out_, QuantizedTensorStorage):
             if not is_output_fp8 or bwd_requires_o_f16:
                 out_f16 = out_.dequantize().view(out_.shape)
         else:
-            if is_output_fp8 or bwd_requires_o_fp8:
+            if is_output_fp8 or bwd_requires_o_fp8 or croissattn_aux_correction:
                 out_fp8 = O_quantizer(out_)
+            if croissattn_aux_correction:
+                # Keep the unrounded product for the softmax correction, but
+                # preserve delayed-scaling DPA's public fp8_output=False
+                # contract: callers receive the dequantized rounded FP8 O.
+                out_aux_f16 = out_
+                if not is_output_fp8:
+                    out_f16 = out_fp8.dequantize().view(out_fp8.shape)
 
         # print quantizers
         print_quantizers(
@@ -1885,9 +1937,20 @@ def _fused_attn_forward_impl(
         fp8_tensors = (None, None, None, None)
         f16_tensors = (None, None, None, None, None, None)
         if is_bwd_fp8:
-            if (qkv_type == "current" and _dpa_fp8_cs_o_in_f16) or qkv_type == "mxfp8":
+            if (
+                croissattn_aux_correction
+                or (qkv_type == "current" and _dpa_fp8_cs_o_in_f16)
+                or qkv_type == "mxfp8"
+            ):
                 fp8_tensors = (q_fp8, k_fp8, v_fp8, None)
-                f16_tensors = (None, None, None, out_f16, None, None)
+                f16_tensors = (
+                    None,
+                    None,
+                    None,
+                    out_aux_f16 if croissattn_aux_correction else out_f16,
+                    None,
+                    None,
+                )
             elif qkv_type == "delayed" or (qkv_type == "current" and not _dpa_fp8_cs_o_in_f16):
                 fp8_tensors = (q_fp8, k_fp8, v_fp8, out_fp8)
         else:
@@ -1948,6 +2011,14 @@ def _fused_attn_forward_impl(
     if is_cpu_offload_enabled() and NVTE_CPU_OFFLOAD_V1:
         if is_bwd_fp8:
             tensor_list = fp8_tensors
+            # The CroissAttn path keeps a distinct BF16/FP16 auxiliary O for
+            # the softmax correction.  It is not part of ``fp8_tensors`` and
+            # is not aliased with the user-visible output, so explicitly mark
+            # it for CPU offload as well.  Without this, the correction would
+            # silently retain one full attention output on device in every
+            # layer and defeat the memory-saving contract of CPU offload.
+            if croissattn_aux_correction:
+                mark_activation_offload(f16_tensors[3])
         else:
             tensor_list = [q, k, v, out_f16]
 
@@ -2008,6 +2079,7 @@ def _fused_attn_forward_impl(
         "dQKV_quantizer": dQKV_quantizer,
         "dO_quantizer": dO_quantizer,
         "dP_quantizer": dP_quantizer,
+        "croissattn_aux_correction": croissattn_aux_correction,
     }
     return out_ret, max_logit, tensors_to_save, ctx_attrs
 
@@ -2062,6 +2134,7 @@ def _fused_attn_setup_ctx(
         "qkv_scale_inv_format",
     ):
         setattr(bwd_args, name, ctx_attrs[name])
+    bwd_args.croissattn_aux_correction = ctx_attrs["croissattn_aux_correction"]
 
     bwd_args.max_seqlen_q = fwd_args.max_seqlen_q
     bwd_args.max_seqlen_kv = fwd_args.max_seqlen_kv
@@ -2269,6 +2342,11 @@ def _fused_attn_backward_impl(
                 if args.qkv_type == "mxfp8":
                     out_ = out
                     aux_ctx_tensors.append(d_out)
+                if args.croissattn_aux_correction:
+                    # Use the F16 O_aux = P @ V_f saved by forward.  The
+                    # quantized FP8 O remains the user-visible activation,
+                    # but must not be used for D* in the softmax derivative.
+                    out_ = out
                 dq_, dk_, dv_, *rest = fused_attn_bwd(
                     args.max_seqlen_q,
                     args.max_seqlen_kv,
@@ -2504,6 +2582,7 @@ def _fused_attn_forward_fake(
         "dQKV_quantizer": None,
         "dO_quantizer": None,
         "dP_quantizer": None,
+        "croissattn_aux_correction": False,
     }
     return out, max_logit, tensors_to_save, ctx_attrs
 

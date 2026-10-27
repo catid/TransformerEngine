@@ -782,7 +782,10 @@ static Fp8BwdGraphAndTensors create_graph_fp8_bwd(const FusedAttnConfig& cfg) {
     scale_s = mha_graph->tensor_like(descale_q, "Scale_s");
     descale_dP = mha_graph->tensor_like(descale_q, "Descale_dP");
     scale_dP = mha_graph->tensor_like(descale_q, "Scale_dP");
-    if (is_current_scaling && is_O_in_F16) {
+    // CroissAttn's auxiliary correction can pass an F16 O_aux even when the
+    // gradients use delayed scaling.  F16 O carries no FP8 scale metadata,
+    // so the backward graph must use a unit descaling factor for every F16 O.
+    if (is_O_in_F16) {
       descale_o = mha_graph->tensor(1.0f);
     } else {
       descale_o = mha_graph->tensor_like(descale_q, "Descale_O");
@@ -1188,7 +1191,7 @@ void fused_attn_fp8_bwd_impl(
       variant_pack[amax_dK] = devPtrAmaxdK;
       variant_pack[amax_dV] = devPtrAmaxdV;
     }
-    if (is_delayed_scaling || (is_current_scaling && !is_O_in_F16)) {
+    if (!is_O_in_F16 && (is_delayed_scaling || is_current_scaling)) {
       variant_pack[descale_o] = devPtrDescaleO;
     }
     if (is_delayed_scaling) {

@@ -997,6 +997,7 @@ def cp_p2p_fwd_fused_attn(
     S_quantizer_per_step,
     O_quantizer_per_step,
     croissattn_aux_correction,
+    amax_per_step,
     rank,
     step,
     cp_size,
@@ -1120,6 +1121,13 @@ def cp_p2p_fwd_fused_attn(
         cuda_graph=_is_cuda_graph_capturing(),
         qkv_scale_inv_format=qkv_scale_inv_format,
     )
+
+    if croissattn_aux_correction:
+        # The temporary current-scaling quantizer keeps O in F16 and therefore
+        # does not populate the delayed quantizer's per-step amax buffer.
+        # Record it explicitly so the final public delayed-FP8 quantization
+        # uses the aggregate amax from all CP tiles.
+        amax_per_step[1][step].copy_(out_per_step.abs().amax())
 
     if fp8:
         softmax_lse_per_step, rng_states = aux_ctx_tensors
@@ -2020,6 +2028,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                             S_quantizer_per_step[i],
                             O_quantizer_per_step[i],
                             croissattn_aux_correction,
+                            amax_per_step,
                             rank,
                             i,
                             cp_size,

@@ -4348,8 +4348,8 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
                                 if not ctx.croissattn_aux_correction and (
                                     ctx.fp8_recipe.delayed()
                                     or (
-                                    ctx.fp8_recipe.float8_current_scaling()
-                                    and not _dpa_fp8_cs_o_in_f16
+                                        ctx.fp8_recipe.float8_current_scaling()
+                                        and not _dpa_fp8_cs_o_in_f16
                                     )
                                 ):
                                     out_part = Float8Tensor.make_like(

@@ -219,12 +219,10 @@ def test_fused_attn_backend_message():
 
 def test_dpa_cuda_graph_capture_detection(monkeypatch):
     """Raw ``torch.cuda.graph`` capture must reach the fused-attention cache."""
-    from transformer_engine.pytorch.attention.dot_product_attention.backends import (
-        _is_cuda_graph_capturing,
-    )
+    from transformer_engine.pytorch.graph import _is_cuda_graph_capturing
 
     monkeypatch.setattr(
-        "transformer_engine.pytorch.attention.dot_product_attention.backends.is_graph_capturing",
+        "transformer_engine.pytorch.graph.is_graph_capturing",
         lambda: False,
     )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)

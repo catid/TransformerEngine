@@ -51,7 +51,7 @@ from transformer_engine.pytorch.distributed import (
     graph_safe_rng_available,
 )
 from transformer_engine.pytorch.jit import no_torch_dynamo
-from transformer_engine.pytorch.graph import is_graph_capturing
+from transformer_engine.pytorch.graph import is_graph_capturing, _is_cuda_graph_capturing
 from transformer_engine.pytorch.attention.inference import InferenceParams
 
 # Import attention utils
@@ -65,7 +65,6 @@ from transformer_engine.pytorch.attention.dot_product_attention.backends import 
     UnfusedDotProductAttention,
     FusedAttention,
     FlashAttention,
-    _is_cuda_graph_capturing,
 )
 
 

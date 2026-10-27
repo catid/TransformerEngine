@@ -68,6 +68,13 @@ def is_graph_capturing() -> bool:
     return _IS_GRAPH_CAPTURING
 
 
+def _is_cuda_graph_capturing() -> bool:
+    """Return whether execution is inside TE or raw CUDA graph capture."""
+    if is_graph_capturing():
+        return True
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
 def graph_pool_handle():
     """
     Returns an opaque token representing the id of a graph memory pool.

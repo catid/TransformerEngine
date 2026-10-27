@@ -27,7 +27,7 @@ from transformer_engine.pytorch.tensor.float8_tensor import (
 from transformer_engine.pytorch.tensor.storage.float8_tensor_storage import Float8TensorStorage
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensorStorage
 from transformer_engine.pytorch.jit import jit_fuser
-from transformer_engine.pytorch.graph import is_graph_capturing
+from transformer_engine.pytorch.graph import _is_cuda_graph_capturing, is_graph_capturing
 from transformer_engine.pytorch.constants import (
     CPLoadBalancingStrategy,
     dist_group_type,
@@ -1117,7 +1117,7 @@ def cp_p2p_fwd_fused_attn(
         cu_seqlens_kv_padded=cu_seqlens_kv_padded_,
         **fp8_meta_kwargs,
         return_max_logit=return_max_logit,
-        cuda_graph=is_graph_capturing(),
+        cuda_graph=_is_cuda_graph_capturing(),
         qkv_scale_inv_format=qkv_scale_inv_format,
     )
 
@@ -1444,7 +1444,7 @@ def cp_p2p_bwd_fused_attn(
         attn_mask_type=attn_mask_type_,
         attn_bias_type=attn_bias_type,
         deterministic=deterministic,
-        cuda_graph=is_graph_capturing(),
+        cuda_graph=_is_cuda_graph_capturing(),
         qkv_scale_inv_format=qkv_scale_inv_format,
         do_scale_inv_format=do_scale_inv_format,
         **fp8_meta_kwargs,
@@ -1712,7 +1712,6 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         if fp8_meta is not None and fp8_meta.get("local_recipes", None) is not None:
             fp8_recipe = fp8_meta["local_recipes"][0]
         _reject_custom_recipe_under_cp(fp8, fp8_recipe)
-        croissattn_aux_correction = _croissattn_aux_enabled(fp8, is_bwd_fp8, fp8_recipe)
         croissattn_aux_correction = _croissattn_aux_enabled(fp8, is_bwd_fp8, fp8_recipe)
         (
             QKV_quantizer,
@@ -3136,7 +3135,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
             and cu_seqlens_q_padded is not None
             and cu_seqlens_kv_padded is not None
         ):
-            if is_graph_capturing():
+            if _is_cuda_graph_capturing():
                 # arange+mask under capture: `tensor[scalar_tensor:]` slicing would
                 # force a GPU->CPU sync that is forbidden during CUDA graph capture.
                 q_pad_mask = torch.arange(dq.shape[0], device=dq.device) >= cu_seqlens_q_padded[-1]
@@ -3460,6 +3459,7 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
         if fp8_meta is not None and fp8_meta.get("local_recipes", None) is not None:
             fp8_recipe = fp8_meta["local_recipes"][0]
         _reject_custom_recipe_under_cp(fp8, fp8_recipe)
+        croissattn_aux_correction = _croissattn_aux_enabled(fp8, is_bwd_fp8, fp8_recipe)
         (
             QKV_quantizer,
             O_quantizer,
@@ -3783,7 +3783,7 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
                             cu_seqlens_kv_padded=cu_seqlens_kv_padded_,
                             window_size=window_size_per_step[i],
                             return_max_logit=return_max_logit,
-                            cuda_graph=is_graph_capturing(),
+                            cuda_graph=_is_cuda_graph_capturing(),
                             qkv_scale_inv_format=qkv_scale_inv_format,
                             **fp8_meta_kwargs,
                         )
@@ -3926,6 +3926,7 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
         bwd_requires_o_fp8 = (
             is_training
             and is_bwd_fp8
+            and not croissattn_aux_correction
             and (
                 fp8_recipe.delayed()
                 or (fp8_recipe.float8_current_scaling() and not _dpa_fp8_cs_o_in_f16)
@@ -3963,7 +3964,14 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
             if fp8_recipe.delayed() or (
                 fp8_recipe.float8_current_scaling() and not _dpa_fp8_cs_o_in_f16
             ):
-                fp8_tensors = (q_fp8_save, k_fp8_save, v_fp8_save, out_fp8)
+                fp8_tensors = (
+                    q_fp8_save,
+                    k_fp8_save,
+                    v_fp8_save,
+                    None if croissattn_aux_correction else out_fp8,
+                )
+                if croissattn_aux_correction:
+                    f16_tensors = (None, None, None, out_f16)
             elif fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16:
                 fp8_tensors = (q_fp8_save, k_fp8_save, v_fp8_save, None)
                 f16_tensors = (None, None, None, out_f16)
@@ -4029,6 +4037,7 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
             ctx.thd_cu_seqlens_q_padded_per_step = thd_cu_seqlens_q_padded_per_step
         ctx.fp8_meta = fp8_meta
         ctx.is_input_fp8 = is_input_fp8
+        ctx.croissattn_aux_correction = croissattn_aux_correction
 
         ctx.dQKV_quantizer = dQKV_quantizer
         ctx.dO_quantizer = dO_quantizer
@@ -4373,7 +4382,7 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
                             attn_bias_type=ctx.attn_bias_type,
                             window_size=window_size_per_step[i],
                             deterministic=ctx.deterministic,
-                            cuda_graph=is_graph_capturing(),
+                            cuda_graph=_is_cuda_graph_capturing(),
                             qkv_scale_inv_format=qkv_scale_inv_format,
                             do_scale_inv_format=do_scale_inv_format,
                             **fp8_meta_kwargs,
@@ -4885,7 +4894,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
                 softmax_type=softmax_type,
                 softmax_offset=softmax_offset,
                 return_max_logit=return_max_logit,
-                cuda_graph=is_graph_capturing(),
+                cuda_graph=_is_cuda_graph_capturing(),
                 qkv_scale_inv_format=qkv_scale_inv_format,
             )
             # construct out_part for backward
@@ -5273,7 +5282,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
                 attn_bias_type=ctx.attn_bias_type,
                 window_size=ctx.window_size,
                 deterministic=ctx.deterministic,
-                cuda_graph=is_graph_capturing(),
+                cuda_graph=_is_cuda_graph_capturing(),
                 qkv_scale_inv_format=ctx.qkv_scale_inv_format,
                 do_scale_inv_format=do_scale_inv_format,
                 **fp8_meta_kwargs,
@@ -5731,7 +5740,7 @@ def attn_forward_func_with_cp(
         )
         assert not fp8, "No-load-balance THD partitioning does not support FP8 yet."
         assert (
-            not is_graph_capturing()
+            not _is_cuda_graph_capturing()
         ), "No-load-balance THD partitioning does not support CUDA graph capture yet."
         assert (
             q.shape[0] == k.shape[0] == v.shape[0]

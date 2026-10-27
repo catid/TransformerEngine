@@ -97,7 +97,7 @@ from transformer_engine.pytorch.attention.dot_product_attention.utils import (
 )
 from transformer_engine.pytorch import export
 from transformer_engine.pytorch.export import is_in_onnx_export_mode
-from transformer_engine.pytorch.graph import is_graph_capturing
+from transformer_engine.pytorch.graph import _is_cuda_graph_capturing
 
 # Global vars for flash attn v2
 flash_attn_cuda_bwd = None
@@ -298,19 +298,6 @@ else:
 # Float8CurrentScaling: fused_attn_bwd takes O in FP8 by default, this flag allows it in F16
 _dpa_fp8_cs_o_in_f16 = os.getenv("NVTE_DPA_FP8CS_O_in_F16", "1") == "1"
 
-
-def _is_cuda_graph_capturing() -> bool:
-    """Return whether DPA is executing under either TE or raw CUDA capture.
-
-    ``is_graph_capturing`` tracks TE's ``make_graphed_callables`` lifecycle,
-    but a direct ``torch.cuda.graph`` capture does not set that Python flag.
-    The attention C++ graph cache must receive the capture bit in both cases;
-    otherwise the CroissAttn auxiliary-output quantization can build a new
-    cuDNN graph or allocate graph state during replay.
-    """
-    if is_graph_capturing():
-        return True
-    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
 # CroissAttn's FP8 backward correction needs the unrounded attention output
 # ``O_aux = P @ V_f``.  The cuDNN FP8 backward API receives the forward output

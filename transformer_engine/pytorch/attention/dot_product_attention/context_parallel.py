@@ -2316,8 +2316,9 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         if fp8 and use_fused_attention and fp8_recipe.delayed():
             amax_cp_fwd = amax_per_step.amax(dim=1)
             S_quantizer.amax.copy_(amax_cp_fwd[0])
-            if not croissattn_aux_correction:
-                O_quantizer.amax.copy_(amax_cp_fwd[1])
+            # The per-step kernels keep O in F16 for CroissAttn, but the
+            # public delayed-FP8 output still uses this aggregate amax.
+            O_quantizer.amax.copy_(amax_cp_fwd[1])
 
         if fp8:
             # print quantizers
@@ -2337,12 +2338,21 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         out_f16 = out.to(fwd_nominal_dtype)
         if (fp8 and is_output_fp8) or (
             is_bwd_fp8
-            and not croissattn_aux_correction
-            and not (fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16)
+            and (
+                croissattn_aux_correction
+                or not (fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16)
+            )
             and not fp8_recipe.mxfp8()
         ):
             out_fp8 = O_quantizer(out_f16)
-        out_ret = out_fp8 if (fp8 and is_output_fp8) else out_f16
+        if fp8 and is_output_fp8:
+            out_ret = out_fp8
+        elif croissattn_aux_correction:
+            # Preserve delayed-FP8's public output contract while retaining
+            # unrounded ``out_f16`` separately for D* in backward.
+            out_ret = out_fp8.dequantize(dtype=fwd_nominal_dtype)
+        else:
+            out_ret = out_f16
 
         ctx.layer_number = layer_number
         ctx.fp8_recipe = fp8_recipe
@@ -3926,15 +3936,20 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
         bwd_requires_o_fp8 = (
             is_training
             and is_bwd_fp8
-            and not croissattn_aux_correction
             and (
-                fp8_recipe.delayed()
+                croissattn_aux_correction
+                or fp8_recipe.delayed()
                 or (fp8_recipe.float8_current_scaling() and not _dpa_fp8_cs_o_in_f16)
             )
         )
         if (fp8 and is_output_fp8) or bwd_requires_o_fp8:
             out_fp8 = O_quantizer(out_f16)
-        out_ret = out_fp8 if is_output_fp8 else out_f16
+        if fp8 and is_output_fp8:
+            out_ret = out_fp8
+        elif croissattn_aux_correction:
+            out_ret = out_fp8.dequantize(dtype=fwd_nominal_dtype)
+        else:
+            out_ret = out_f16
 
         # save tensors for backward
         ctx.fp8 = is_bwd_fp8
@@ -4771,6 +4786,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
         if fp8_meta is not None and fp8_meta.get("local_recipes", None) is not None:
             fp8_recipe = fp8_meta["local_recipes"][0]
         _reject_custom_recipe_under_cp(fp8, fp8_recipe)
+        croissattn_aux_correction = _croissattn_aux_enabled(fp8, is_bwd_fp8, fp8_recipe)
 
         fwd_nominal_dtype = q.dtype
         fused_attn_backend = None
@@ -4794,7 +4810,16 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             if not fp8_recipe.mxfp8():
                 q, k, v = [q_fp8._data, k_fp8._data, v_fp8._data]
             fp8_meta_kwargs["s_quantizer"] = S_quantizer
-            fp8_meta_kwargs["o_quantizer"] = O_quantizer
+            fp8_meta_kwargs["o_quantizer"] = (
+                Float8CurrentScalingQuantizer(
+                    fp8_dtype=O_quantizer.dtype,
+                    device=q.device,
+                    rowwise=True,
+                    columnwise=False,
+                )
+                if croissattn_aux_correction
+                else O_quantizer
+            )
         else:
             if use_fused_attention:
                 fused_attn_backend = FusedAttnBackend["F16_arbitrary_seqlen"]
@@ -4838,6 +4863,8 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             or (
                 is_bwd_fp8
                 and (
+                    croissattn_aux_correction
+                    or
                     (fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16)
                     or fp8_recipe.mxfp8()
                 )
@@ -4846,6 +4873,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
         bwd_requires_o_fp8 = (
             is_training
             and is_bwd_fp8
+            and not croissattn_aux_correction
             and (
                 fp8_recipe.delayed()
                 or (fp8_recipe.float8_current_scaling() and not _dpa_fp8_cs_o_in_f16)
@@ -5002,7 +5030,12 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
         # out_ret: output tensor for forward pass
         # out_fp8 and out_f16 are reused here to store the FP8 or F16 tensor for forward returns
         if fp8:
-            if fp8_recipe.delayed():
+            if croissattn_aux_correction:
+                # The fused kernel returned the unrounded O_aux in F16.  Keep
+                # it for backward, and quantize a separate public result.
+                out_fp8 = O_quantizer(out_)
+                out_f16 = out_fp8.dequantize(dtype=fwd_nominal_dtype)
+            elif fp8_recipe.delayed():
                 out_fp8 = Float8Tensor.make_like(out_fp8, data=out_, dtype=fwd_nominal_dtype)
             if is_output_fp8:
                 if fp8_recipe.float8_current_scaling() or fp8_recipe.mxfp8():
@@ -5041,7 +5074,10 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             if ctx.fp8:
                 # FP8DS or (FP8CS+not _dpa_fp8_cs_o_in_f16): q/k/v/o all in FP8
                 # (FP8CS+_dpa_fp8_cs_o_in_f16) or MXFP8: q/k/v in FP8, o in F16
-                if (
+                if croissattn_aux_correction:
+                    fp8_tensors = (q_part, k_part, v_part, None)
+                    f16_tensors = (None, None, None, out_part)
+                elif (
                     fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16
                 ) or fp8_recipe.mxfp8():
                     fp8_tensors = (q_part, k_part, v_part, None)
@@ -5090,6 +5126,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
         ctx.use_fused_attention = use_fused_attention
         ctx.fp8_meta = fp8_meta
         ctx.is_input_fp8 = is_input_fp8
+        ctx.croissattn_aux_correction = croissattn_aux_correction
         ctx.is_output_fp8 = is_output_fp8
         ctx.fwd_nominal_dtype = fwd_nominal_dtype
         ctx.fp8_recipe = fp8_recipe
@@ -5244,7 +5281,8 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             do_scale_inv_format = None
             q_part, k_part, v_part, out_part, dout_part = q, k, v, out, dout
             if ctx.fp8:
-                q_part, k_part, v_part, out_part = q_fp8, k_fp8, v_fp8, out_fp8
+                q_part, k_part, v_part = q_fp8, k_fp8, v_fp8
+                out_part = out if ctx.croissattn_aux_correction else out_fp8
                 if (
                     ctx.fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16
                 ) or ctx.fp8_recipe.mxfp8():

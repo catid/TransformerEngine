@@ -1348,6 +1348,7 @@ def cp_p2p_bwd_fused_attn(
     dQKV_quantizer_per_step,
     QKV_quantizer_per_step,
     dO_quantizer_per_step,
+    croissattn_aux_correction,
     q_part,
     k_part,
     v_part,
@@ -1404,7 +1405,9 @@ def cp_p2p_bwd_fused_attn(
                 used_in_backward=True,
             )
         if not fp8_recipe.mxfp8():
-            if not (fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16):
+            if not croissattn_aux_correction and not (
+                fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16
+            ):
                 out_part = Float8Tensor.make_like(out_fp8, data=out_part, dtype=fwd_nominal_dtype)
             dout_part = Float8Tensor.make_like(dout_fp8, data=dout_part, dtype=bwd_nominal_dtype)
         else:
@@ -1709,6 +1712,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         if fp8_meta is not None and fp8_meta.get("local_recipes", None) is not None:
             fp8_recipe = fp8_meta["local_recipes"][0]
         _reject_custom_recipe_under_cp(fp8, fp8_recipe)
+        croissattn_aux_correction = _croissattn_aux_enabled(fp8, is_bwd_fp8, fp8_recipe)
         croissattn_aux_correction = _croissattn_aux_enabled(fp8, is_bwd_fp8, fp8_recipe)
         (
             QKV_quantizer,
@@ -2313,7 +2317,8 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         if fp8 and use_fused_attention and fp8_recipe.delayed():
             amax_cp_fwd = amax_per_step.amax(dim=1)
             S_quantizer.amax.copy_(amax_cp_fwd[0])
-            O_quantizer.amax.copy_(amax_cp_fwd[1])
+            if not croissattn_aux_correction:
+                O_quantizer.amax.copy_(amax_cp_fwd[1])
 
         if fp8:
             # print quantizers
@@ -2333,6 +2338,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         out_f16 = out.to(fwd_nominal_dtype)
         if (fp8 and is_output_fp8) or (
             is_bwd_fp8
+            and not croissattn_aux_correction
             and not (fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16)
             and not fp8_recipe.mxfp8()
         ):
@@ -2356,8 +2362,10 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         out_f16 = out_part
         if ctx.fp8:
             # fwd: fp8, bwd: fp8, save all fp8
-            fp8_tensors = (q_fp8, kv_fp8, out_fp8)
-            if fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16:
+            fp8_tensors = (q_fp8, kv_fp8, None if croissattn_aux_correction else out_fp8)
+            if croissattn_aux_correction:
+                f16_tensors = (None, None, out_f16)
+            elif fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16:
                 f16_tensors = (None, None, out_f16)
             elif fp8_recipe.mxfp8():
                 f16_tensors = (q, kv, out_f16)
@@ -2423,6 +2431,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         ctx.second_half_lse_seqlen = second_half_lse_seqlen
         ctx.fp8_meta = fp8_meta
         ctx.is_input_fp8 = is_input_fp8
+        ctx.croissattn_aux_correction = croissattn_aux_correction
         ctx.is_output_fp8 = is_output_fp8
         ctx.use_flash_attn_3 = use_flash_attn_3
         ctx.use_flash_attn_4 = use_flash_attn_4
@@ -2585,7 +2594,8 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                     kv_fp8._data,
                     (
                         out
-                        if ctx.fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16
+                        if ctx.croissattn_aux_correction
+                        or (ctx.fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16)
                         else out_fp8._data
                     ),
                 )
@@ -2787,7 +2797,8 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                     kv_fp8,
                     (
                         out
-                        if (ctx.fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16)
+                        if ctx.croissattn_aux_correction
+                        or (ctx.fp8_recipe.float8_current_scaling() and _dpa_fp8_cs_o_in_f16)
                         or ctx.fp8_recipe.mxfp8()
                         else out_fp8
                     ),
@@ -2822,6 +2833,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                     dQKV_quantizer_per_step[i],
                     ctx.QKV_quantizer,
                     ctx.dO_quantizer,
+                    ctx.croissattn_aux_correction,
                 ]
             else:
                 flash_attn_inputs = [
@@ -3471,7 +3483,16 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
             if not fp8_recipe.mxfp8():
                 q, k, v = [q_fp8._data, k_fp8._data, v_fp8._data]
             fp8_meta_kwargs["s_quantizer"] = S_quantizer
-            fp8_meta_kwargs["o_quantizer"] = O_quantizer
+            fp8_meta_kwargs["o_quantizer"] = (
+                Float8CurrentScalingQuantizer(
+                    fp8_dtype=O_quantizer.dtype,
+                    device=q.device,
+                    rowwise=True,
+                    columnwise=False,
+                )
+                if croissattn_aux_correction
+                else O_quantizer
+            )
         elif use_fused_attention:
             fused_attn_backend = FusedAttnBackend["F16_arbitrary_seqlen"]
         orig_q_shape, _, orig_v_shape = q.shape, k.shape, v.shape

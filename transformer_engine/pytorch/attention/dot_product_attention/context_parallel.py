@@ -27,7 +27,7 @@ from transformer_engine.pytorch.tensor.float8_tensor import (
 from transformer_engine.pytorch.tensor.storage.float8_tensor_storage import Float8TensorStorage
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensorStorage
 from transformer_engine.pytorch.jit import jit_fuser
-from transformer_engine.pytorch.graph import _is_cuda_graph_capturing, is_graph_capturing
+from transformer_engine.pytorch.graph import _is_cuda_graph_capturing
 from transformer_engine.pytorch.constants import (
     CPLoadBalancingStrategy,
     dist_group_type,

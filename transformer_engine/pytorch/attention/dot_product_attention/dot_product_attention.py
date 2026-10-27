@@ -203,7 +203,7 @@ def _validate_thd_policy_sequence_ids(policies: List[Dict[str, Any]], batch_size
             _thd_policy_validation_cache.append(_thd_policy_validation_cache.pop(cache_index))
             return
 
-    if is_graph_capturing():
+    if _is_cuda_graph_capturing():
         raise RuntimeError(
             "Mixed THD policy sequence_ids must be validated by an eager warm-up call "
             "before CUDA graph capture."
@@ -2323,7 +2323,7 @@ class DotProductAttention(TransformerEngineBaseModule):
             allow_different_data_and_param_types=self.softmax_type != "vanilla",
         ) as query_layer:
             # checks for RNG
-            if self.rng_states_tracker is not None and is_graph_capturing():
+            if self.rng_states_tracker is not None and _is_cuda_graph_capturing():
                 assert isinstance(
                     self.rng_states_tracker, CudaRNGStatesTracker
                 ), "Unsupported RNG states tracker."

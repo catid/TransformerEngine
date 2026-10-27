@@ -314,12 +314,8 @@ def _is_cuda_graph_capturing() -> bool:
 
 # CroissAttn's FP8 backward correction needs the unrounded attention output
 # ``O_aux = P @ V_f``.  The cuDNN FP8 backward API receives the forward output
-# tensor, so delayed-scaling attention normally gives it the rounded FP8 ``O``.
-# The opt-in path below asks cuDNN to materialize the same output in F16,
-# quantizes a separate copy for the user-visible result, and feeds the F16
-# auxiliary output back to cuDNN.  Keeping this disabled by default preserves
-# the upstream execution path while making the correction available for
-# reproducible experiments.
+# tensor, so delayed-scaling attention materializes O in F16, quantizes a
+# separate copy for the user-visible result, and feeds O_aux back to cuDNN.
 def _qkv_quantizer_type(qkv_quantizer):
     """Map a DPA QKV quantizer instance to its kernel-facing FP8 sub-recipe label.
 
@@ -1783,13 +1779,9 @@ def _fused_attn_forward_impl(
     qkv_type = _qkv_quantizer_type(QKV_quantizer) if fp8 else None
 
     # Delayed-scaling FP8 is the recipe whose forward output is rounded to
-    # FP8.  Current-scaling and MXFP8 already keep O in F16 for backward.
-    croissattn_aux_correction = (
-        os.environ.get("NVTE_DPA_CROISSATTN_AUX", "0") == "1"
-        and is_training
-        and is_bwd_fp8
-        and qkv_type == "delayed"
-    )
+    # FP8.  Keep the unrounded O_aux = P @ V_f for its backward correction.
+    # Current-scaling and MXFP8 already keep O in F16 for backward.
+    croissattn_aux_correction = is_training and is_bwd_fp8 and qkv_type == "delayed"
     # get nominal data type for out
     # FP16/BF16 attention: torch.float16 or torch.bfloat16
     # FP8 attention:       torch.float16 or torch.bfloat16

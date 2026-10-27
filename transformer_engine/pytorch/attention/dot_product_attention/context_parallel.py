@@ -20,7 +20,10 @@ from transformer_engine.pytorch.cpp_extensions.fused_attn import (
     FusedAttnBackend,
 )
 from transformer_engine.pytorch.quantization import FP8GlobalStateManager
-from transformer_engine.pytorch.tensor.float8_tensor import Float8Tensor
+from transformer_engine.pytorch.tensor.float8_tensor import (
+    Float8Tensor,
+    Float8CurrentScalingQuantizer,
+)
 from transformer_engine.pytorch.tensor.storage.float8_tensor_storage import Float8TensorStorage
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensorStorage
 from transformer_engine.pytorch.jit import jit_fuser
@@ -74,18 +77,6 @@ def _reject_custom_recipe_under_cp(fp8, fp8_recipe):
     lands, surface the limitation here with a clear error rather than
     failing later in C++ assertions or with silently-wrong gradients.
     """
-    if (
-        fp8
-        and os.environ.get("NVTE_DPA_CROISSATTN_AUX", "0") == "1"
-        and int(os.environ.get("NVTE_FP8_DPA_BWD", "1"))
-        and fp8_recipe is not None
-        and fp8_recipe.delayed()
-    ):
-        raise NotImplementedError(
-            "NVTE_DPA_CROISSATTN_AUX currently supports single-device fused attention only; "
-            "context-parallel delayed-scaling FP8 attention is not implemented. Disable "
-            "NVTE_DPA_CROISSATTN_AUX when using context parallelism."
-        )
     if fp8 and fp8_recipe is not None and fp8_recipe.custom():
         raise NotImplementedError(
             "CustomRecipe + Context Parallelism is not yet supported for FP8 "
@@ -94,6 +85,20 @@ def _reject_custom_recipe_under_cp(fp8, fp8_recipe):
             "MXFP8BlockScaling) for CP. The single-device CustomRecipe + DPA "
             "path is supported."
         )
+
+
+def _croissattn_aux_enabled(fp8, is_bwd_fp8, fp8_recipe):
+    """Whether CP should retain an unrounded delayed-FP8 output for D*.
+
+    The correction follows the same delayed-scaling and FP8-backward
+    restrictions as the single-device path.
+    """
+    return (
+        fp8
+        and is_bwd_fp8
+        and fp8_recipe is not None
+        and fp8_recipe.delayed()
+    )
 
 
 def get_bsh_dims(tensor_format):
@@ -991,6 +996,7 @@ def cp_p2p_fwd_fused_attn(
     QKV_quantizer,
     S_quantizer_per_step,
     O_quantizer_per_step,
+    croissattn_aux_correction,
     rank,
     step,
     cp_size,
@@ -1703,6 +1709,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         if fp8_meta is not None and fp8_meta.get("local_recipes", None) is not None:
             fp8_recipe = fp8_meta["local_recipes"][0]
         _reject_custom_recipe_under_cp(fp8, fp8_recipe)
+        croissattn_aux_correction = _croissattn_aux_enabled(fp8, is_bwd_fp8, fp8_recipe)
         (
             QKV_quantizer,
             O_quantizer,
@@ -1787,6 +1794,16 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                 if fp8_recipe.delayed():
                     S_quantizer_per_step[i].amax = amax_per_step[0][i].reshape((1,))
                     O_quantizer_per_step[i].amax = amax_per_step[1][i].reshape((1,))
+                if croissattn_aux_correction:
+                    # Keep each partial PV product in F16 for the online
+                    # softmax merge and the later D* correction.  The public
+                    # result is quantized once after all CP steps complete.
+                    O_quantizer_per_step[i] = Float8CurrentScalingQuantizer(
+                        fp8_dtype=O_quantizer.dtype,
+                        device=q.device,
+                        rowwise=True,
+                        columnwise=False,
+                    )
         else:
             # q_f16:   torch.Tensor, dtype=fwd_nominal_dtype
             # q, k, v: torch.Tensor, dtype=fwd_nominal_dtype
@@ -1999,6 +2016,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                             QKV_quantizer,
                             S_quantizer_per_step[i],
                             O_quantizer_per_step[i],
+                            croissattn_aux_correction,
                             rank,
                             i,
                             cp_size,
@@ -2166,11 +2184,13 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                             )
                     if fp8:
                         # dequantize out_per_step to torch.float32
-                        if fp8_recipe.delayed():
+                        if fp8_recipe.delayed() and isinstance(
+                            out_per_step[(i - 1) % 2], QuantizedTensorStorage
+                        ):
                             out_per_step[(i - 1) % 2] = out_per_step[(i - 1) % 2].dequantize(
                                 dtype=torch.float32
                             )
-                        if fp8_recipe.float8_current_scaling() or fp8_recipe.mxfp8():
+                        if croissattn_aux_correction or fp8_recipe.float8_current_scaling() or fp8_recipe.mxfp8():
                             out_per_step[(i - 1) % 2] = out_per_step[(i - 1) % 2].to(
                                 dtype=torch.float32
                             )

@@ -343,11 +343,6 @@ class AttentionParams:
     has_score_mod_bprop: bool = False
     device: Optional[torch.device] = None
     requires_backward: bool = True
-    # Opt-in CroissAttn auxiliary-output correction.  Keep this in the cache
-    # key so toggling the environment variable between calls cannot reuse a
-    # backend selection made for the other output contract.
-    croissattn_aux: bool = False
-
     def __eq__(self, other):
         """
         Overwrite dataclass.__eq__ so that only fp8_meta["recipe"] is compared,
@@ -591,9 +586,6 @@ def get_attention_backend(
         run_config["NVTE_FP8_DPA_BWD"] = int(os.environ.get("NVTE_FP8_DPA_BWD", "1"))
         # Float8CurrentScaling: 1: use F16 O in bwd, 0: use FP8 O in bwd
         run_config["NVTE_DPA_FP8CS_O_in_F16"] = int(os.environ.get("NVTE_DPA_FP8CS_O_in_F16", "1"))
-        run_config["NVTE_DPA_CROISSATTN_AUX"] = int(
-            os.environ.get("NVTE_DPA_CROISSATTN_AUX", "0")
-        )
         # switch recipe to "F16", "DelayedScaling", or "Float8CurrentScaling"
         _dpa_fp8_recipe = os.environ.get("NVTE_DPA_FP8_RECIPE", "")
         run_config["NVTE_DPA_FP8_RECIPE"] = _dpa_fp8_recipe
@@ -629,38 +621,10 @@ def get_attention_backend(
     flash_attention_backend = None
     use_fused_attention = int(os.environ.get("NVTE_FUSED_ATTN", "1"))
     use_unfused_attention = int(os.environ.get("NVTE_UNFUSED_ATTN", "1"))
-    # CroissAttn's auxiliary output is implemented by the cuDNN fused FP8
-    # path.  Do not silently fall back to FlashAttention or the unfused
-    # emulation when the opt-in switch is enabled; those paths would run the
-    # old backward semantics.  If cuDNN fused attention is disabled or cannot
-    # support the shape, the normal no-backend error below tells the user how
-    # to resolve it.
-    # ``fp8_meta['recipe']`` may describe the S/dP delayed-scaling tensors
-    # even when QKV/O use current scaling.  Prefer the local QKV recipe, which
-    # is the same family dispatch used by the fused backend itself.
-    local_recipes = fp8_meta.get("local_recipes", ()) if fp8_meta is not None else ()
-    effective_dpa_recipe = local_recipes[0] if local_recipes else (
-        fp8_meta.get("recipe") if fp8_meta is not None else None
-    )
-    croissattn_aux_requested = (
-        os.environ.get("NVTE_DPA_CROISSATTN_AUX", "0") == "1"
-        and fp8
-        and is_training
-        and int(os.environ.get("NVTE_FP8_DPA_BWD", "1"))
-        and effective_dpa_recipe is not None
-        and effective_dpa_recipe.delayed()
-    )
-    if croissattn_aux_requested:
-        if not use_fused_attention:
-            logger.debug(
-                "CroissAttn auxiliary correction requires FusedAttention; "
-                "NVTE_FUSED_ATTN=0 disables the required backend"
-            )
-        use_flash_attention = False
-        use_flash_attention_2 = False
-        use_flash_attention_3 = False
-        use_flash_attention_4 = False
-        use_unfused_attention = False
+    # FlashAttention and the unfused implementation preserve O_aux through
+    # their autograd paths, while FusedAttention uses the separate F16 output
+    # handled in backends.py.  Keep all supported backends eligible; backend
+    # selection must not silently bypass the correction.
     if not use_flash_attention_2 and FlashAttentionUtils.is_installed:
         logger.debug("Disabling FlashAttention 2 due to NVTE_FLASH_ATTN=0 or NVTE_FLASH_ATTN_V2=0")
     if not use_flash_attention_3 and FlashAttentionUtils.v3_is_installed:

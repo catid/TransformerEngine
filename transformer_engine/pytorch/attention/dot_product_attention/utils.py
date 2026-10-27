@@ -747,14 +747,12 @@ def get_attention_backend(
             if FlashAttentionUtils.v3_is_installed:
                 logger.debug("Disabling FlashAttention 3 for %s", fp8_recipe.__class__.__name__)
             use_flash_attention_3 = False
-        if use_unfused_attention:
-            allow_emulation = (
-                os.environ.get("NVTE_UnfusedDPA_Emulate_FP8", "0") == "1"
-                or is_in_onnx_export_mode()
-            )
-            if not allow_emulation:
-                logger.debug("Disabling UnfusedDotProductAttention for FP8 attention")
-                use_unfused_attention = False
+        # The unfused implementation emulates FP8 with autograd-aware
+        # quantization wrappers.  Its backward keeps the unrounded O, which
+        # is the CroissAttn correction, so it is safe as the default fallback
+        # when fused attention is unavailable.  The legacy
+        # NVTE_UnfusedDPA_Emulate_FP8 variable remains accepted but no longer
+        # gates this correctness-preserving path.
         if use_fused_attention and fp8_recipe.delayed():
             if (
                 device_compute_capability >= (10, 0)

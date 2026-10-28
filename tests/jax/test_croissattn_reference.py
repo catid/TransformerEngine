@@ -36,6 +36,7 @@ def test_croissattn_reference_finite_and_corrected_vjp():
     dp = jnp.einsum("bhid,bhjd->bhij", do_rec, v_rec)
     dstar = jnp.sum(doh * o_aux, axis=-1, keepdims=True)
     ds = p * (dp - dstar)
+    ds = _quantize_axis(ds, -1)
     expected_q = jnp.transpose(
         jnp.einsum("bhij,bhjd->bhid", ds, k_rec) * 0.25,
         (0, 2, 1, 3),
@@ -47,6 +48,25 @@ def test_croissattn_reference_finite_and_corrected_vjp():
         )
     )(q)
     np.testing.assert_allclose(np.asarray(actual), np.asarray(expected_q), rtol=2e-2, atol=2e-2)
+
+
+def test_croissattn_reference_gqa_collapses_kv_gradients():
+    """Grouped-query expansion must sum the repeated K/V head gradients."""
+    key = jax.random.key(31)
+    q = jax.random.normal(key, (1, 32, 4, 16), dtype=jnp.bfloat16)
+    k = jax.random.normal(key, (1, 32, 2, 16), dtype=jnp.bfloat16)
+    v = jax.random.normal(key, (1, 32, 2, 16), dtype=jnp.bfloat16)
+
+    def loss(q_, k_, v_):
+        return jnp.sum(croissattn_reference(q_, k_, v_, 0.25, True).astype(jnp.float32))
+
+    dq, dk, dv = jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
+    assert dq.shape == q.shape
+    assert dk.shape == k.shape
+    assert dv.shape == v.shape
+    assert bool(jnp.all(jnp.isfinite(dq)))
+    assert bool(jnp.all(jnp.isfinite(dk)))
+    assert bool(jnp.all(jnp.isfinite(dv)))
 
 
 def test_croissattn_reference_gqa_jit_vjp():

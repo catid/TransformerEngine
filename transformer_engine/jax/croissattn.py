@@ -414,12 +414,14 @@ def _bwd(res, dout):
             # dS K and dS^T Q use consumer-axis recasts for every saved
             # factor.  This is the fix that prevents silently reusing a
             # factor quantized on the wrong (forward) axis.
+            ds_q = _quantize_axis(ds_ij, -1)
+            ds_k = _quantize_axis(ds_ij, -2)
             dq_delta = jnp.einsum(
-                "bhij,bhjd->bhid", ds_ij, k_j, precision=jax.lax.Precision.HIGHEST
+                "bhij,bhjd->bhid", ds_q, k_j, precision=jax.lax.Precision.HIGHEST
             ) * scale
             q_j = jax.lax.dynamic_slice(q_rec, (0, 0, q0, 0), (b, h, tile, d))
             dk_delta = jnp.einsum(
-                "bhij,bhid->bhjd", ds_ij, q_j, precision=jax.lax.Precision.HIGHEST
+                "bhij,bhid->bhjd", ds_k, q_j, precision=jax.lax.Precision.HIGHEST
             ) * scale
             # U^T (L^-1 dO), with dO normalized before quantization.
             dv_delta = jnp.einsum(

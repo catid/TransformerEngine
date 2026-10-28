@@ -33,6 +33,7 @@ load_framework_extension("jax")
 
 from . import flax
 from . import quantize
+from . import croissattn
 
 from .quantize import autocast, fp8_autocast, update_collections
 from .quantize import NVTE_FP8_COLLECTION_NAME
@@ -51,4 +52,5 @@ __all__ = [
     "MeshResource",
     "flax",
     "quantize",
+    "croissattn",
 ]
